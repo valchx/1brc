@@ -81,11 +81,13 @@ const Records = struct {
 const BUF_SIZE = 1024 * 1024;
 
 fn readFileChunk(
-    alloc: std.mem.Allocator,
     io: std.Io,
     file_path: []const u8,
 ) !void {
-    var records = Records.init(alloc);
+    var records_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer records_arena.deinit();
+
+    var records = Records.init(records_arena.allocator());
     defer records.deinit();
 
     // TODO : Optimal buffer size ?
@@ -149,9 +151,6 @@ pub fn main() !void {
 
     const file_path = args.next() orelse @panic("File path not provided.");
 
-    var records_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer records_arena.deinit();
-
     const concurrent = true;
     if (concurrent) {
         // var threaded = std.Io.Threaded.init_single_threaded;
@@ -162,10 +161,7 @@ pub fn main() !void {
         // const thread_limit = io.concurrent_limit.toInt() orelse return error.NoThreadLimit;
         // try readFileChunk(io, file_path);
 
-        var thread_safe = std.heap.ThreadSafeAllocator{ .child_allocator = records_arena.allocator() };
-
         var task = try io.concurrent(readFileChunk, .{
-            thread_safe.allocator(),
             io,
             file_path,
         });
@@ -174,6 +170,6 @@ pub fn main() !void {
     } else {
         var threaded = std.Io.Threaded.init_single_threaded;
         const io = threaded.io();
-        try readFileChunk(records_arena.allocator(), io, file_path);
+        try readFileChunk(io, file_path);
     }
 }
