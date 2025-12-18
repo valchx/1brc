@@ -20,7 +20,11 @@ const Record = struct {
     pub fn add(self: *Self, value: f32) void {
         self.max = @max(self.max, value);
         self.min = @min(self.min, value);
-        self.count += 1;
+        self.addToMean(value, 1);
+    }
+
+    pub fn addToMean(self: *Self, value: f32, count: u32) void {
+        self.count += count;
         const f_count: f32 = @floatFromInt(self.count);
         self.mean += (value - self.mean) / f_count;
     }
@@ -29,7 +33,6 @@ const Record = struct {
 const Records = struct {
     const Self = @This();
 
-    allocator: std.mem.Allocator,
     map: std.StringHashMap(Record),
 
     pub fn init(alloc: std.mem.Allocator) Self {
@@ -37,12 +40,11 @@ const Records = struct {
 
         return Self{
             .map = map,
-            .allocator = alloc,
         };
     }
 
     pub fn deinit(self: *Self) void {
-        // TODO : Free all the keys ?
+        // TODO : Free all the keys ? This is allocator agnostic
         self.map.deinit();
     }
 
@@ -50,7 +52,8 @@ const Records = struct {
         if (self.map.getPtr(key)) |entry| {
             entry.add(value);
         } else {
-            const own_key = try self.allocator.alloc(u8, key.len);
+            // TODO : Use map's allocator from the struct directly.
+            const own_key = try self.map.allocator.alloc(u8, key.len);
             @memcpy(own_key, key);
 
             try self.map.put(own_key, .init(value));
@@ -75,6 +78,25 @@ const Records = struct {
             );
         } else {}
     }
+
+    pub fn merge(self: *Self, records: Self) !void {
+        var incoming_entries = records.map.iterator();
+        while (incoming_entries.next()) |entry| {
+            const city_name = entry.key_ptr.*;
+            const city_data = entry.value_ptr.*;
+
+            if (self.map.getPtr(city_name)) |own_record| {
+                own_record.min = @min(own_record.min, city_data.min);
+                own_record.max = @max(own_record.max, city_data.max);
+                own_record.addToMean(city_data.mean, city_data.count);
+            } else {
+                const own_key = try self.map.allocator.alloc(u8, city_name.len);
+                @memcpy(own_key, city_name);
+
+                try self.map.put(own_key, city_data);
+            }
+        } else {}
+    }
 };
 
 // 1 MiB
@@ -83,6 +105,7 @@ const BUF_SIZE = 1024 * 1024;
 fn readFileChunk(
     io: std.Io,
     file_path: []const u8,
+    master_records: *Records,
 ) !void {
     var records_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer records_arena.deinit();
@@ -90,7 +113,6 @@ fn readFileChunk(
     var records = Records.init(records_arena.allocator());
     defer records.deinit();
 
-    // TODO : Optimal buffer size ?
     var buffer: [BUF_SIZE]u8 = undefined;
     const file = std.fs.cwd().openFile(
         file_path,
@@ -109,23 +131,19 @@ fn readFileChunk(
     var index: u32 = 0;
     while (reader.takeDelimiterExclusive('\n')) |line| {
         reader.toss(1);
-        std.debug.print("{d}: \"{s}\"\n", .{ index, line });
 
         var line_iter = std.mem.splitAny(u8, line, ";");
         const city_name = line_iter.next() orelse {
             return error.ParseError;
         };
-        std.debug.print("\tcity_name: '{s}'\n", .{city_name});
 
         const city_temp = brk: {
             const str = line_iter.next() orelse {
                 return error.ParseError;
             };
-            std.debug.print("\tcity_temp_str: '{s}'\n", .{str});
 
             break :brk try std.fmt.parseFloat(f32, str);
         };
-        std.debug.print("\tcity_temp: '{}'\n", .{city_temp});
 
         try records.update(city_name, city_temp);
 
@@ -137,7 +155,7 @@ fn readFileChunk(
         }
     }
 
-    // records.print();
+    try master_records.merge(records);
 }
 
 pub fn main() !void {
@@ -150,6 +168,11 @@ pub fn main() !void {
     _ = args.next();
 
     const file_path = args.next() orelse @panic("File path not provided.");
+
+    var records_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer records_arena.deinit();
+    var thread_safe = std.heap.ThreadSafeAllocator{ .child_allocator = records_arena.allocator() };
+    var records = Records.init(thread_safe.allocator());
 
     const concurrent = true;
     if (concurrent) {
@@ -164,12 +187,15 @@ pub fn main() !void {
         var task = try io.concurrent(readFileChunk, .{
             io,
             file_path,
+            &records,
         });
 
         try task.await(io);
     } else {
         var threaded = std.Io.Threaded.init_single_threaded;
         const io = threaded.io();
-        try readFileChunk(io, file_path);
+        try readFileChunk(io, file_path, &records);
     }
+
+    records.print();
 }
