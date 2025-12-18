@@ -1,53 +1,131 @@
 const std = @import("std");
 
 const Record = struct {
+    const Self = @This();
+
     min: f32 = std.math.floatMax(f32),
     max: f32 = std.math.floatMax(f32),
     mean: f32 = 0,
     count: u32 = 0,
+
+    pub fn init(value: f32) Self {
+        return .{
+            .min = value,
+            .max = value,
+            .mean = value,
+            .count = 1,
+        };
+    }
+
+    pub fn add(self: *Self, value: f32) void {
+        self.max = @max(self.max, value);
+        self.min = @min(self.min, value);
+        self.count += 1;
+        const f_count: f32 = @floatFromInt(self.count);
+        self.mean += (value - self.mean) / f_count;
+    }
 };
 
+const Records = struct {
+    const Self = @This();
+
+    allocator: std.mem.Allocator,
+    map: std.StringHashMap(Record),
+
+    pub fn init(alloc: std.mem.Allocator) Self {
+        const map = std.StringHashMap(Record).init(alloc);
+
+        return Self{
+            .map = map,
+            .allocator = alloc,
+        };
+    }
+
+    pub fn deinit(self: *Self) void {
+        // TODO : Free all the keys ?
+        self.map.deinit();
+    }
+
+    pub fn update(self: *Self, key: []const u8, value: f32) !void {
+        if (self.map.getPtr(key)) |entry| {
+            entry.add(value);
+        } else {
+            const own_key = try self.allocator.alloc(u8, key.len);
+            @memcpy(own_key, key);
+
+            try self.map.put(own_key, .init(value));
+        }
+    }
+
+    pub fn print(self: Self) void {
+        std.debug.print("Records\n", .{});
+        var entries = self.map.iterator();
+        while (entries.next()) |entry| {
+            const city_name = entry.key_ptr.*;
+            const city_data = entry.value_ptr.*;
+            std.debug.print(
+                "{s} : ({}, {}, {}, {})\n",
+                .{
+                    city_name,
+                    city_data.min,
+                    city_data.mean,
+                    city_data.max,
+                    city_data.count,
+                },
+            );
+        } else {}
+    }
+};
+
+// 1 MiB
+const BUF_SIZE = 1024 * 1024;
+
 fn readFileChunk(
-    file: std.fs.File,
-    seek: u64,
-    map_alloc: std.mem.Allocator,
-) !std.StringHashMap(Record) {
-    var map = std.StringHashMap(Record).init(map_alloc);
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    file_path: []const u8,
+) !void {
+    var records = Records.init(alloc);
+    defer records.deinit();
 
     // TODO : Optimal buffer size ?
-    var buffer: [1028]u8 = undefined;
-    try file.seekTo(seek);
-    var reader_wrapper = file.reader(&buffer);
-    const reader: *std.Io.Reader = &reader_wrapper.interface;
+    var buffer: [BUF_SIZE]u8 = undefined;
+    const file = std.fs.cwd().openFile(
+        file_path,
+        .{
+            .mode = .read_only,
+        },
+    ) catch |err| {
+        std.debug.print("ERR: {any}", .{err});
+        @panic("Could not open file.");
+    };
+    defer file.close();
 
-    try reader.readSliceAll(&buffer);
+    var reader_wrapper = file.reader(io, &buffer);
+    const reader: *std.Io.Reader = &reader_wrapper.interface;
 
     var index: u32 = 0;
     while (reader.takeDelimiterExclusive('\n')) |line| {
         reader.toss(1);
+        std.debug.print("{d}: \"{s}\"\n", .{ index, line });
 
         var line_iter = std.mem.splitAny(u8, line, ";");
-        const city_name = line_iter.next() orelse return error.ParseError;
+        const city_name = line_iter.next() orelse {
+            return error.ParseError;
+        };
+        std.debug.print("\tcity_name: '{s}'\n", .{city_name});
+
         const city_temp = brk: {
-            const str = line_iter.next() orelse return error.ParseError;
+            const str = line_iter.next() orelse {
+                return error.ParseError;
+            };
+            std.debug.print("\tcity_temp_str: '{s}'\n", .{str});
 
             break :brk try std.fmt.parseFloat(f32, str);
         };
+        std.debug.print("\tcity_temp: '{}'\n", .{city_temp});
 
-        const key = try map_alloc.alloc(u8, city_name.len);
-        @memmove(key, city_name);
-        const entry = try map.getOrPut((key));
-        if (entry.found_existing) {
-            entry.value_ptr.*.max = @max(entry.value_ptr.max, city_temp);
-            entry.value_ptr.*.min = @min(entry.value_ptr.min, city_temp);
-            entry.value_ptr.*.count += 1;
-            entry.value_ptr.*.mean += (city_temp - entry.value_ptr.*.mean) / @as(f32, @floatFromInt(entry.value_ptr.*.count));
-        } else {
-            entry.value_ptr.*.max = city_temp;
-            entry.value_ptr.*.min = city_temp;
-            entry.value_ptr.*.count = 1;
-            entry.value_ptr.*.mean = city_temp;
-        }
+        try records.update(city_name, city_temp);
 
         index += 1;
     } else |err| {
@@ -57,61 +135,45 @@ fn readFileChunk(
         }
     }
 
-    return map;
+    // records.print();
 }
 
 pub fn main() !void {
-    // - Split file in chunks
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     const alloc = gpa.allocator();
 
     var args = try std.process.argsWithAllocator(alloc);
     defer args.deinit();
 
-    // Ignore program name
     _ = args.next();
 
     const file_path = args.next() orelse @panic("File path not provided.");
 
-    const file = std.fs.cwd().openFile(
-        file_path,
-        .{ .mode = .read_only },
-    ) catch |err| {
-        std.debug.print("ERR: {any}", .{err});
-        @panic("Could not open file.");
-    };
-    defer file.close();
+    var records_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer records_arena.deinit();
 
-    // const file_stat = file.stat() catch {
-    //     @panic("Could not stat file.");
-    // };
+    const concurrent = true;
+    if (concurrent) {
+        // var threaded = std.Io.Threaded.init_single_threaded;
+        var threaded = std.Io.Threaded.init(gpa.allocator());
+        defer threaded.deinit();
+        const io = threaded.io();
 
-    // file_stat.size // SPLIT FILE & CHUNKS
+        // const thread_limit = io.concurrent_limit.toInt() orelse return error.NoThreadLimit;
+        // try readFileChunk(io, file_path);
 
-    // - Read chunks in parallel
-    // - Compute min, mean and max temps per chunk
-    var map_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer map_arena.deinit();
-    var map = try readFileChunk(file, 0, map_arena.allocator());
-    defer map.deinit();
+        var thread_safe = std.heap.ThreadSafeAllocator{ .child_allocator = records_arena.allocator() };
 
-    var entries = map.iterator();
-    while (entries.next()) |entry| {
-        const city_name = entry.key_ptr.*;
-        const city_data = entry.value_ptr.*;
-        std.debug.print(
-            "{s} : ({}, {}, {}, {})\n",
-            .{
-                city_name,
-                city_data.min,
-                city_data.mean,
-                city_data.max,
-                city_data.count,
-            },
-        );
-    } else {}
+        var task = try io.concurrent(readFileChunk, .{
+            thread_safe.allocator(),
+            io,
+            file_path,
+        });
 
-    // - Aggregate all the chunks.
-
-    // - Print JSON
+        try task.await(io);
+    } else {
+        var threaded = std.Io.Threaded.init_single_threaded;
+        const io = threaded.io();
+        try readFileChunk(records_arena.allocator(), io, file_path);
+    }
 }
