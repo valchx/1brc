@@ -63,10 +63,10 @@ const Records = struct {
         }
     }
 
-    pub fn print(self: Self) !void {
-        const stdout_file = std.fs.File.stdout();
+    pub fn print(self: Self, io: std.Io) !void {
+        const stdout_file = std.Io.File.stdout();
         var buffer: [BUF_SIZE]u8 = undefined;
-        var stdout = stdout_file.writer(&buffer);
+        var stdout = stdout_file.writer(io, &buffer);
 
         try stdout.interface.writeByte('{');
 
@@ -149,7 +149,8 @@ fn readFileChunk(
     var records = Records.init(records_arena.allocator());
     defer records.deinit();
 
-    const file = std.fs.cwd().openFile(
+    const file = std.Io.Dir.cwd().openFile(
+        io,
         file_path,
         .{
             .mode = .read_only,
@@ -158,7 +159,7 @@ fn readFileChunk(
         std.debug.print("ERR: {any}", .{err});
         @panic("Could not open file.");
     };
-    defer file.close();
+    defer file.close(io);
 
     var buffer: [BUF_SIZE]u8 = undefined;
     var reader = file.reader(io, &buffer);
@@ -226,21 +227,17 @@ fn readFileChunkUnsafe(
     };
 }
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    const alloc = gpa.allocator();
-
-    var args = try std.process.argsWithAllocator(alloc);
-    defer args.deinit();
+pub fn main(init: std.process.Init) !void {
+    var args = init.minimal.args.iterate();
 
     _ = args.next();
 
     const file_path = args.next() orelse @panic("File path not provided.");
 
-    var file = try std.fs.cwd().openFile(file_path, .{ .mode = .read_only });
-    const file_stat = try file.stat();
+    var file = try std.Io.Dir.cwd().openFile(init.io, file_path, .{ .mode = .read_only });
+    const file_stat = try file.stat(init.io);
     const file_size = file_stat.size;
-    file.close();
+    file.close(init.io);
 
     var records_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer records_arena.deinit();
@@ -254,7 +251,7 @@ pub fn main() !void {
         return error.NoThreadLimit;
     };
     if (file_size > 128 * thread_count) {
-        var threaded = std.Io.Threaded.init(gpa.allocator());
+        var threaded = std.Io.Threaded.init(init.gpa, .{ .environ = init.minimal.environ });
         defer threaded.deinit();
         const io = threaded.io();
         var group = std.Io.Group.init;
@@ -273,7 +270,7 @@ pub fn main() !void {
             });
         }
 
-        group.wait(io);
+        try group.await(io);
     } else {
         var threaded = std.Io.Threaded.init_single_threaded;
         const io = threaded.io();
@@ -286,5 +283,5 @@ pub fn main() !void {
         );
     }
 
-    try records.print();
+    try records.print(init.io);
 }
